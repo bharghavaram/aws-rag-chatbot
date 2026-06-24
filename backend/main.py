@@ -5,12 +5,9 @@ from pydantic import BaseModel, field_validator
 import database
 import rag
 
-app = FastAPI(
-    title="AWS Customer Agreement Q&A",
-    description="RAG pipeline for querying the AWS Customer Agreement PDF",
-    version="1.0.0",
-)
+app = FastAPI(title="AWS Agreement Q&A")
 
+# allow_origins=["*"] is fine for a local assignment — not for prod
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,14 +28,13 @@ class AskRequest(BaseModel):
         if not v:
             raise ValueError("Question cannot be empty.")
         if len(v) > 2000:
-            raise ValueError("Question is too long (limit: 2000 characters).")
+            raise ValueError("Question is too long (limit: 2000 chars).")
         return v
 
 
 class AskResponse(BaseModel):
     answer: str
     sources: list[dict]
-    source_summary: str
     answer_found: bool
     response_time_seconds: float
 
@@ -47,16 +43,18 @@ class IngestResponse(BaseModel):
     message: str
     pages_loaded: int
     chunks_created: int
-    chunk_size: int
-    chunk_overlap: int
 
 
 @app.post("/ingest", response_model=IngestResponse)
 def ingest():
-    """Process the PDF and build the FAISS index. Run this once before using /ask."""
+    # run once before /ask — builds the FAISS index from the PDF
     try:
         res = rag.ingest_pdf()
-        return IngestResponse(message="PDF ingested and indexed successfully.", **res)
+        return IngestResponse(
+            message="done",
+            pages_loaded=res["pages_loaded"],
+            chunks_created=res["chunks_created"],
+        )
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -65,7 +63,6 @@ def ingest():
 
 @app.post("/ask", response_model=AskResponse)
 def ask(body: AskRequest):
-    """Run the RAG pipeline for a question. Logs every request to SQLite."""
     try:
         res = rag.answer_question(body.question)
     except RuntimeError as e:
@@ -84,7 +81,6 @@ def ask(body: AskRequest):
     return AskResponse(
         answer=res["answer"],
         sources=res["sources"],
-        source_summary=res["source_summary"],
         answer_found=res["answer_found"],
         response_time_seconds=res["response_time"],
     )
@@ -92,7 +88,6 @@ def ask(body: AskRequest):
 
 @app.get("/analytics")
 def analytics():
-    """Return usage stats pulled from the SQL database."""
     try:
         return database.get_analytics()
     except Exception as e:
