@@ -1,10 +1,11 @@
 import os
 
-# chunk size and overlap — see README for the reasoning
+# these felt right after testing — reasoning in README and report.md
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 200
 TOP_K = 4
 
+# all-MiniLM-L6-v2: fast on CPU, no API key needed, good enough for English legal text
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 HF_API_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN", "")
