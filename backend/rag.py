@@ -33,17 +33,19 @@ def ingest_pdf():
 
     if not os.path.exists(PDF_PATH):
         raise FileNotFoundError(
-            f"Could not find PDF at {PDF_PATH}. "
-            "Place 'AWS Customer Agreement.pdf' inside the data/ folder and try again."
+            f"PDF not found at {PDF_PATH}. "
+            "Put 'AWS Customer Agreement.pdf' in the data/ folder."
         )
 
     loader = PyPDFLoader(PDF_PATH)
     pages = loader.load()
 
-    # chunk_size=1000 works well for this doc — most clauses fit in ~600-900 chars,
-    # so 1000 keeps each clause in one chunk without mixing unrelated sections.
-    # overlap=200 because some clauses reference the one above them so I don't
-    # want important text getting cut at the boundary.
+    # chunk_size=1000 because most clauses in this doc are 400-900 chars.
+    # keeping one clause per chunk made retrieval noticeably better.
+    # overlap=200 — legal text often references the clause above, so some
+    # overlap reduces the chance of losing that context at a boundary.
+    # I tried 400-char chunks first and retrieval was noticeably worse —
+    # the LLM kept getting fragments with no surrounding context.
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -57,14 +59,11 @@ def ingest_pdf():
     os.makedirs(os.path.dirname(VECTORSTORE_PATH), exist_ok=True)
     _vectorstore.save_local(VECTORSTORE_PATH)
 
-    _qa_chain = None  # force rebuild on next question
+    _qa_chain = None  # rebuild on next /ask call
 
     return {
         "pages_loaded": len(pages),
         "chunks_created": len(chunks),
-        "chunk_size": CHUNK_SIZE,
-        "chunk_overlap": CHUNK_OVERLAP,
-        "vectorstore_path": VECTORSTORE_PATH,
     }
 
 
@@ -74,12 +73,14 @@ def _load_store():
         return
     idx = VECTORSTORE_PATH + ".faiss"
     if not os.path.exists(idx):
-        raise RuntimeError("No index found — please call POST /ingest first.")
+        raise RuntimeError("No index on disk — call POST /ingest first.")
     emb = _get_embeddings()
-    _vectorstore = FAISS.load_local(VECTORSTORE_PATH, emb, allow_dangerous_deserialization=True)
+    _vectorstore = FAISS.load_local(
+        VECTORSTORE_PATH, emb, allow_dangerous_deserialization=True
+    )
 
 
-def _get_chain():
+def _build_chain():
     global _qa_chain
     if _qa_chain is not None:
         return _qa_chain
@@ -88,15 +89,16 @@ def _get_chain():
 
     if not HF_API_TOKEN:
         raise RuntimeError(
-            "HUGGINGFACEHUB_API_TOKEN is missing. "
-            "Get a free token from https://huggingface.co/settings/tokens and set it as an env variable."
+            "HUGGINGFACEHUB_API_TOKEN not set. "
+            "Get a free token from https://huggingface.co/settings/tokens"
         )
 
+    # keeping the prompt tight — if I give the model too much room it starts
+    # hallucinating things that sound plausible but aren't in the agreement
     prompt = PromptTemplate(
         input_variables=["context", "question"],
-        template="""You are a helpful assistant that answers questions about the AWS Customer Agreement.
-Only use the information in the context provided below. Do not use any prior knowledge.
-If the answer isn't in the context, say: "I could not find an answer to this question in the AWS Customer Agreement."
+        template="""Answer the question using only the context below.
+If the answer is not in the context, say: "I could not find an answer to this question in the AWS Customer Agreement."
 
 Context:
 {context}
@@ -112,9 +114,9 @@ Answer:"""
         model_kwargs={"temperature": 0.1, "max_new_tokens": 512},
     )
 
-    # top_k=4: tried 2 (too few, missed multi-section answers) and 6 (added noise).
-    # 4 gave the best results on questions like "What are AWS responsibilities?"
-    # which spans sections 1.1 through 1.6.
+    # k=4: tried 2 (too few for broad questions) and 6 (added noise).
+    # "What are AWS's responsibilities?" spans sections 1.1–1.6, so 2 chunks wasn't enough.
+    # TODO: add a similarity score threshold so we skip the LLM when chunks are irrelevant
     retriever = _vectorstore.as_retriever(search_kwargs={"k": TOP_K})
 
     _qa_chain = RetrievalQA.from_chain_type(
@@ -130,7 +132,7 @@ Answer:"""
 def answer_question(question: str) -> dict:
     t0 = time.time()
 
-    chain = _get_chain()
+    chain = _build_chain()
     result = chain.invoke({"query": question})
 
     elapsed = round(time.time() - t0, 3)
@@ -153,6 +155,7 @@ def answer_question(question: str) -> dict:
             "snippet": snippet,
         })
 
+    # compact summary for the DB row — storing full chunks would bloat the table
     src_summary = "; ".join(
         f"Page {s['page']}: {s['snippet'][:80]}..." for s in sources[:2]
     )
